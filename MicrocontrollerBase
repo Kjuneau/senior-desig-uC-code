@@ -1,0 +1,380 @@
+/*
+ * 
+ * Author: Kevin Juneau
+ * 
+ * Base Station FSK
+ * Code to send and receive FSK data to downhole tool
+ * 
+ */
+#include "mcc_generated_files/mcc.h"
+#pragma warning disable 520     // warning: (520) function "xyz" is never called  3
+#pragma warning disable 1498    // fputc.c:16:: warning: (1498) pointer (unknown)
+
+//defines
+#define BIT_PERIOD 0x000F // period of each bit / time to send one bit
+#define HI_THRESH 80
+#define LO_THRESH 40
+#define BUFFER_SIZE 64 // size of buffer for frequency estimate
+#define MESSAGE_SIZE 16 // number of bits in message
+#define FUDGE_FACTOR 104 // fudge factor to tune input frequency accuracy
+
+//variables
+uint8_t amplitude = 5;
+uint16_t phaseIncrement;
+uint8_t sin[64] =  {128,140,153,165,177,188,199,209,
+                    218,227,234,241,246,250,253,255,
+                    255,255,253,250,246,241,234,227,
+                    218,209,199,188,177,165,153,140,
+                    128,115,103, 91, 79, 68, 56, 47,
+                     37, 29, 22, 15, 10,  6,  2,  1,
+                      0,  1,  2,  6, 10, 15, 22, 29,
+                     37, 47, 56, 68, 79, 91,103,115};
+
+uint16_t bufferIn[BUFFER_SIZE];
+
+uint8_t testBuffer[BUFFER_SIZE];
+
+//flags
+bool M = false;
+bool R = false;
+bool generateWave = false;
+bool receiveMessage = false;
+bool bufferFull = false;
+bool messageFull = false;
+bool newSample = false;
+        
+    
+// sending variables
+uint16_t messageOut = 0;
+bool sendBit;
+short sendCode;
+
+// receiving variables
+uint16_t messageIn = 0;
+short receiveCode = 0;
+
+//functions
+uint16_t Convert(void);
+void TMR0ISR(void);
+void TMR3ISR(void);
+uint8_t AvgFreq(void);
+void MainSendData(void);
+void MainReceiveData(void);
+uint8_t Filter(void);
+
+//main
+void main(void) 
+{
+    //local variables
+    char cmd;
+    uint8_t i;
+
+    ADC_Initialize();
+    SYSTEM_Initialize();
+    
+    // Provide Baud rate generator time to stabilize before splash screen
+    TMR0_WriteTimer(0x10000);
+    INTCONbits.TMR0IF = 0;
+    while (INTCONbits.TMR0IF == 0);
+
+    TMR0_SetInterruptHandler(TMR0ISR);
+    TMR3_SetInterruptHandler(TMR3ISR);
+    
+    INTERRUPT_GlobalInterruptEnable();    
+    INTERRUPT_PeripheralInterruptEnable();
+
+    for (;;) {
+        
+        MainSendData();
+        MainReceiveData();
+        
+        if (EUSART1_DataReady) 
+        { // wait for incoming data on USART
+            cmd = EUSART1_Read();
+            switch (cmd) 
+            { // and do what it tells you to do
+                case '?':
+                    printf("-------------------------------------------------\r\n");
+                    printf("?: help menu\r\n");
+                    printf("o: k\r\n");
+                    printf("Z: Reset processor\r\n");
+                    printf("z: Clear the terminal\r\n");
+                    printf("S/s: Start/stop fixed frequency sine wave\r\n");
+                    printf("f: enter Frequency\r\n");
+                    printf("A/a: increase/decrease Amplitude select amplitude\r\n");
+                    printf("M: Enter binary message to send\r\n");
+                    printf("R: Receive FSK message\r\n");
+                    printf("-------------------------------------------------\r\n");
+                    break;
+                    
+                case 'o':
+                    printf("o:	ok\r\n");
+                    break;
+                   
+                case 'Z':
+                    for (i = 0; i < 40; i++) printf("\n");
+                    RESET();
+                    break;
+                
+                case 'z':
+                    for (i = 0; i < 40; i++) printf("\n");
+                    break;
+                    
+                case 'S':
+                    generateWave = 1;
+                    printf("Generating sine wave.\r\n");
+                    break;
+                    
+                case 's':
+                    generateWave = 0;
+                    printf("Stopped generating sine wave.\r\n");
+                    break;
+                    
+                case 'f':
+                    printf("Enter the new frequency.\r\n");
+                    phaseIncrement = 2*Convert();
+                    break;
+                    
+                case 'A':
+                    if (amplitude < 15) 
+                    {
+                        amplitude++;
+                        printf("Amplitude is %d/16.\r\n",amplitude);
+                    } 
+                    else 
+                    {
+                        printf("Amplitude is already at its maximum.\r\n");
+                        printf("Amplitude is %d/16.\r\n",amplitude);
+                    }
+                    break;
+                    
+                case 'a':
+                    if (amplitude > 1) 
+                    {
+                        amplitude--;
+                        printf("Amplitude is %d/16.\r\n",amplitude);
+                    }
+                    else 
+                    {
+                        printf("Amplitude is already at its minimum.\r\n");
+                        printf("Amplitude is %d/16.\r\n",amplitude);
+                    }
+                    break;
+
+                
+                case 'M':
+                    M = true;
+                    break;
+
+                
+                case 'R':
+                    R = true;
+                    break;
+                    
+                case 'T':
+                    
+                    
+                default:
+                    printf("%c is an invalid input.",cmd);
+                    break;
+                
+            }
+        }
+    }
+}
+
+// Gets message from USART, generates FSK wave
+void MainSendData(void)
+{
+    static uint8_t messageIndex = 0;
+    static bool getMessage = true;
+    if (M)
+    {
+        if (getMessage)
+        {
+            printf("Enter send code\r\n");
+            messageOut = Convert() << 12; // put sendCode at the first 4 bits
+            printf("Enter message\r\n");
+            messageOut = messageOut + Convert(); // add message as the last 12 bits
+            getMessage = false;
+        }
+        
+        if (messageIndex < 16 && TMR1_HasOverflowOccured())
+        {
+            sendBit = messageOut & 0x0001;
+            messageOut = messageOut >> 1;
+            if (sendBit) phaseIncrement = 2*1075;
+            else phaseIncrement = 2*925;
+            generateWave = true;
+            TMR1_WriteTimer(0x10000 - BIT_PERIOD);
+            messageIndex++;
+        }
+        else if (messageIndex >= 16)
+        {
+            generateWave = false;
+            M = false;
+            getMessage = true;
+            messageIndex = 0;
+        }
+    }
+    else
+    {
+        generateWave = false;
+    }
+}
+
+// Receive FSK message and convert to integer
+void MainReceiveData(void)
+{
+    static uint8_t bitNum = 0;
+    static uint8_t index = 0;
+    if (R)
+    {
+        if (newSample)
+        {
+            newSample = false;
+            // trigger if message is incoming
+            if (!receiveMessage && (ADRESH > HI_THRESH || ADRESH < LO_THRESH))
+            {
+                receiveMessage = true;
+            }
+
+            // sample input and fill buffer
+            if (receiveMessage)
+            {
+                if (index == BUFFER_SIZE) {
+                    bufferFull = true;
+                    bitNum++;
+                    index = 0;
+                }
+                else
+                {
+                    bufferIn[index] = ADRESH;
+                    index++;
+                }
+            }
+
+            // trigger if full message is read
+            if (bitNum == MESSAGE_SIZE)
+            {
+                messageFull = true;
+                receiveMessage = false;
+            }
+        }
+        if (receiveMessage) // message incoming
+        {
+
+            if (bufferFull)
+            {
+                messageIn = (messageIn << 1) + Filter();
+                bufferFull = false;
+            }
+            if (messageFull)
+            {
+                receiveCode = (messageIn & 0x0F00) >> 12;
+                messageIn = messageIn & 0x0FFF;
+                printf("Code: %d    Message: %d\r\n",receiveCode,messageIn);
+                messageIn = 0;
+                messageFull = false;
+                R = false;
+            }
+        }
+    }
+}
+
+// Gets multi-digit number as input
+uint16_t Convert(void) 
+{
+    printf("> ");
+    uint16_t num = 0;
+    char input = '0';
+    do {
+        num = num * 10;
+        num = num + (input - '0');
+        input = EUSART1_Read();
+        printf("%c",input);
+    } while (input != '\r');
+    printf("\r\n");
+    return num;
+}
+
+// Filtering
+uint8_t Filter(void)
+{
+    float filterLo[64] = { 0.000393,-0.000348,-0.001283,-0.002205,-0.002738,-0.002387,-0.000731, 0.002260,
+                           0.005965, 0.009064, 0.009859, 0.006946, 0.000000,-0.009656,-0.019076,-0.024455,
+                          -0.022503,-0.011950, 0.005433, 0.024861, 0.039785, 0.044085, 0.034470, 0.012142,
+                          -0.017024,-0.044049,-0.059741,-0.057947,-0.037972,-0.005185, 0.030499, 0.057843,
+                           0.068060, 0.057843, 0.030499,-0.005185,-0.037972,-0.057947,-0.059741,-0.044049,
+                          -0.017024, 0.012142, 0.034470, 0.044085, 0.039785, 0.024861, 0.005433,-0.011950,
+                          -0.022503,-0.024455,-0.019076,-0.009656, 0.000000, 0.006946, 0.009859, 0.009064,
+                           0.005965, 0.002260,-0.000731,-0.002387,-0.002738,-0.002205,-0.001283,-0.000348,
+                           0.000393};
+    float filterHi[64] = {-0.001028,-0.001485,-0.001280,-0.000177, 0.001689, 0.003567, 0.004160, 0.002255,
+                          -0.002274,-0.007738,-0.010909,-0.008618, 0.000000, 0.011980, 0.021107, 0.020877,
+                           0.008579,-0.011928,-0.030889,-0.037155,-0.024543, 0.003550, 0.034407, 0.051760,
+                           0.044488, 0.013498,-0.027409,-0.057841,-0.061328,-0.034472, 0.010490, 0.051491,
+                           0.067936, 0.051491, 0.010490,-0.034472,-0.061328,-0.057841,-0.027409, 0.013498,
+                           0.044488, 0.051760, 0.034407, 0.003550,-0.024543,-0.037155,-0.030889,-0.011928,
+                           0.008579, 0.020877, 0.021107, 0.011980, 0.000000,-0.008618,-0.010909,-0.007738,
+                          -0.002274, 0.002255, 0.004160, 0.003567, 0.001689,-0.000177,-0.001280,-0.001485,
+                          -0.001028};
+    
+    float hiVal = 0;
+    float loVal = 0;
+    for (int i = 0; i < 64; i++)
+    {
+        hiVal += filterHi[i] * bufferIn[i];
+        loVal += filterLo[i] * bufferIn[i];
+    }
+    if (hiVal < 0) hiVal *= -1;
+    if (loVal < 0) loVal *= -1;
+    
+    return (hiVal > loVal);
+}
+
+// DDS ISR
+void TMR0ISR(void) 
+{
+    uint8_t local;
+    uint8_t localDiv2, localDiv4, localDiv8, localDiv16;
+    uint8_t total = 0;
+    uint8_t index = 0;
+    static uint16_t phaseAccumulator = 0;
+    
+    //generate wave
+    if (generateWave == 1) 
+    {
+        phaseAccumulator = phaseAccumulator + phaseIncrement;
+        index = phaseAccumulator >> 10;
+        local = sin[index];
+        localDiv2  = local >> 1;
+        localDiv4  = local >> 2;
+        localDiv8  = local >> 3;
+        localDiv16 = local >> 4;
+        total = 0;
+        if (amplitude&0b0001) total += localDiv16;
+        if (amplitude&0b0010) total += localDiv8;
+        if (amplitude&0b0100) total += localDiv4;
+        if (amplitude&0b1000) total += localDiv2;
+        EPWM1_LoadDutyValue(total);
+    } 
+    else 
+    {
+        EPWM1_LoadDutyValue(0x00);
+    }
+    
+    INTCONbits.TMR0IF = 0;
+    TMR0_WriteTimer(0x10000-244);
+}
+
+void TMR3ISR(void)
+{
+    ADCON0bits.GO_NOT_DONE = 1;
+    newSample = true;
+    TMR3_WriteTimer(0xe8f0); //tune if needed
+}
+
+// Send message format
+// "//code//://value//;\n"
+// both //code// and //value// are decimals
