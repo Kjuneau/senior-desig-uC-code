@@ -6,16 +6,24 @@
  * Code to send and receive FSK data to downhole tool
  * 
  */
+
+// todo:
+// add additional FIR filters for second set of frequencies
+// make receiving data capture signal based on how long bit has been high/low
+
 #include "mcc_generated_files/mcc.h"
 #pragma warning disable 520     // warning: (520) function "xyz" is never called  3
 #pragma warning disable 1498    // fputc.c:16:: warning: (1498) pointer (unknown)
 
 //defines
-#define BIT_PERIOD 0x000F // period of each bit / time to send one bit
+#define BIT_PERIOD 0x0000 // period of each bit / time to send one bit
+#define FREQUENCY 1000 // frequency for sending data
+
 #define HI_THRESH 80
 #define LO_THRESH 40
 #define BUFFER_SIZE 64 // size of buffer for frequency estimate
 #define MESSAGE_SIZE 16 // number of bits in message
+
 #define FUDGE_FACTOR 104 // fudge factor to tune input frequency accuracy
 
 //variables
@@ -30,37 +38,37 @@ uint8_t sin[64] =  {128,140,153,165,177,188,199,209,
                       0,  1,  2,  6, 10, 15, 22, 29,
                      37, 47, 56, 68, 79, 91,103,115};
 
-uint16_t bufferIn[BUFFER_SIZE];
-
-uint8_t testBuffer[BUFFER_SIZE];
-
-//flags
+// sending flags
 bool M = false;
-bool R = false;
 bool generateWave = false;
+
+// receiving flags
+bool R = false;
+bool newSample = false;
 bool receiveMessage = false;
 bool bufferFull = false;
 bool messageFull = false;
-bool newSample = false;
-        
-    
+
 // sending variables
 uint16_t messageOut = 0;
 bool sendBit;
 short sendCode;
 
 // receiving variables
+uint16_t bufferIn[BUFFER_SIZE];
 uint16_t messageIn = 0;
 short receiveCode = 0;
 
-//functions
+// sending functions
+void MainSendData(void);
 uint16_t Convert(void);
 void TMR0ISR(void);
-void TMR3ISR(void);
-uint8_t AvgFreq(void);
-void MainSendData(void);
+
+//receiving functions
 void MainReceiveData(void);
 uint8_t Filter(void);
+void TMR3ISR(void);
+void MessageRoutine(short receiveCode, uint8_t messageIn);
 
 //main
 void main(void) 
@@ -73,7 +81,7 @@ void main(void)
     SYSTEM_Initialize();
     
     // Provide Baud rate generator time to stabilize before splash screen
-    TMR0_WriteTimer(0x10000);
+    TMR0_WriteTimer(0xFFFF);
     INTCONbits.TMR0IF = 0;
     while (INTCONbits.TMR0IF == 0);
 
@@ -203,10 +211,10 @@ void MainSendData(void)
         {
             sendBit = messageOut & 0x0001;
             messageOut = messageOut >> 1;
-            if (sendBit) phaseIncrement = 2*1075;
-            else phaseIncrement = 2*925;
+            if (sendBit) phaseIncrement = 2*(FREQUENCY + 0.075 * FREQUENCY);
+            else phaseIncrement = 2*(FREQUENCY - 0.075 * FREQUENCY);
             generateWave = true;
-            TMR1_WriteTimer(0x10000 - BIT_PERIOD);
+            TMR1_WriteTimer(BIT_PERIOD);
             messageIndex++;
         }
         else if (messageIndex >= 16)
@@ -221,6 +229,57 @@ void MainSendData(void)
     {
         generateWave = false;
     }
+}
+
+// Gets multi-digit number as input
+uint16_t Convert(void) 
+{
+    printf("> ");
+    uint16_t num = 0;
+    char input = '0';
+    do {
+        num = num * 10;
+        num = num + (input - '0');
+        input = EUSART1_Read();
+        printf("%c",input);
+    } while (input != '\r');
+    printf("\r\n");
+    return num;
+}
+
+// DDS ISR
+void TMR0ISR(void) 
+{
+    uint8_t local;
+    uint8_t localDiv2, localDiv4, localDiv8, localDiv16;
+    uint8_t total = 0;
+    uint8_t index = 0;
+    static uint16_t phaseAccumulator = 0;
+    
+    //generate wave
+    if (generateWave == 1) 
+    {
+        phaseAccumulator = phaseAccumulator + phaseIncrement;
+        index = phaseAccumulator >> 10;
+        local = sin[index];
+        localDiv2  = local >> 1;
+        localDiv4  = local >> 2;
+        localDiv8  = local >> 3;
+        localDiv16 = local >> 4;
+        total = 0;
+        if (amplitude&0b0001) total += localDiv16;
+        if (amplitude&0b0010) total += localDiv8;
+        if (amplitude&0b0100) total += localDiv4;
+        if (amplitude&0b1000) total += localDiv2;
+        EPWM1_LoadDutyValue(total);
+    } 
+    else 
+    {
+        EPWM1_LoadDutyValue(0x00);
+    }
+    
+    INTCONbits.TMR0IF = 0;
+    TMR0_WriteTimer(0x10000-244);
 }
 
 // Receive FSK message and convert to integer
@@ -273,29 +332,12 @@ void MainReceiveData(void)
             {
                 receiveCode = (messageIn & 0x0F00) >> 12;
                 messageIn = messageIn & 0x0FFF;
-                printf("Code: %d    Message: %d\r\n",receiveCode,messageIn);
-                messageIn = 0;
+                MessageRoutine(receiveCode,messageIn);
                 messageFull = false;
                 R = false;
             }
         }
     }
-}
-
-// Gets multi-digit number as input
-uint16_t Convert(void) 
-{
-    printf("> ");
-    uint16_t num = 0;
-    char input = '0';
-    do {
-        num = num * 10;
-        num = num + (input - '0');
-        input = EUSART1_Read();
-        printf("%c",input);
-    } while (input != '\r');
-    printf("\r\n");
-    return num;
 }
 
 // Filtering
@@ -333,41 +375,6 @@ uint8_t Filter(void)
     return (hiVal > loVal);
 }
 
-// DDS ISR
-void TMR0ISR(void) 
-{
-    uint8_t local;
-    uint8_t localDiv2, localDiv4, localDiv8, localDiv16;
-    uint8_t total = 0;
-    uint8_t index = 0;
-    static uint16_t phaseAccumulator = 0;
-    
-    //generate wave
-    if (generateWave == 1) 
-    {
-        phaseAccumulator = phaseAccumulator + phaseIncrement;
-        index = phaseAccumulator >> 10;
-        local = sin[index];
-        localDiv2  = local >> 1;
-        localDiv4  = local >> 2;
-        localDiv8  = local >> 3;
-        localDiv16 = local >> 4;
-        total = 0;
-        if (amplitude&0b0001) total += localDiv16;
-        if (amplitude&0b0010) total += localDiv8;
-        if (amplitude&0b0100) total += localDiv4;
-        if (amplitude&0b1000) total += localDiv2;
-        EPWM1_LoadDutyValue(total);
-    } 
-    else 
-    {
-        EPWM1_LoadDutyValue(0x00);
-    }
-    
-    INTCONbits.TMR0IF = 0;
-    TMR0_WriteTimer(0x10000-244);
-}
-
 void TMR3ISR(void)
 {
     ADCON0bits.GO_NOT_DONE = 1;
@@ -375,6 +382,52 @@ void TMR3ISR(void)
     TMR3_WriteTimer(0xe8f0); //tune if needed
 }
 
-// Send message format
-// "//code//://value//;\n"
-// both //code// and //value// are decimals
+// Deal with message
+void MessageRoutine(short receiveCode, uint8_t messageIn)
+{
+    printf("Code: %d    Message: %d\r\n",receiveCode,messageIn);
+    // code for surface microcontroller
+    if (true)
+    {
+        
+        switch (receiveCode)
+        {
+            case 0:
+                break;
+                
+            case 1:
+                printf("Temperature: %d\r\n",messageIn);
+                break;
+                
+            case 2:
+                printf("Unit Status: %d\r\n",messageIn);
+                break;
+                
+            default:
+                printf("Code: %d Message: %d\r\n",receiveCode,messageIn);
+                break;
+        }
+        
+    }
+    // code for downhole microcontroller
+    if (false) 
+    {
+        
+        switch (receiveCode)
+        {
+            case 0:
+                break;
+                
+            case 1: // set pins
+                break;
+                
+            case 2: // send temperature data
+                break;
+                
+            default:
+                break;
+                
+        }
+        
+    }
+}
