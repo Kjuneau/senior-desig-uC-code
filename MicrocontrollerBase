@@ -21,10 +21,21 @@
 
 #define HI_THRESH 80
 #define LO_THRESH 40
-#define BUFFER_SIZE 64 // size of buffer for frequency estimate
+
+#define FILTER_SIZE 16 // size of moving average filter
+#define BUFFER_SIZE 16 // size of buffer for frequency estimate
 #define MESSAGE_SIZE 16 // number of bits in message
 
+
 #define FUDGE_FACTOR 104 // fudge factor to tune input frequency accuracy
+
+enum READ_STATE
+{
+    IDLE = 0,
+    READ = 1,
+    FILTER = 2,
+    FILL_MESSAGE = 3
+};
 
 //variables
 uint8_t amplitude = 5;
@@ -55,7 +66,9 @@ bool sendBit;
 short sendCode;
 
 // receiving variables
+enum READ_STATE currentState = IDLE;
 uint16_t bufferIn[BUFFER_SIZE];
+bool filterIn[FILTER_SIZE];
 uint16_t messageIn = 0;
 short receiveCode = 0;
 
@@ -68,7 +81,8 @@ void TMR0ISR(void);
 void MainReceiveData(void);
 uint8_t Filter(void);
 void TMR3ISR(void);
-void MessageRoutine(short receiveCode, uint8_t messageIn);
+void MessageRoutine(void);
+void ClearBuffer(void);
 
 //main
 void main(void) 
@@ -168,7 +182,6 @@ void main(void)
                         printf("Amplitude is %d/16.\r\n",amplitude);
                     }
                     break;
-
                 
                 case 'M':
                     M = true;
@@ -176,11 +189,11 @@ void main(void)
 
                 
                 case 'R':
-                    R = true;
+                    R = !R;
                     break;
                     
                 case 'T':
-                    
+                    break;
                     
                 default:
                     printf("%c is an invalid input.",cmd);
@@ -216,6 +229,8 @@ void MainSendData(void)
             generateWave = true;
             TMR1_WriteTimer(BIT_PERIOD);
             messageIndex++;
+            
+            TEST_PIN_Toggle();
         }
         else if (messageIndex >= 16)
         {
@@ -285,56 +300,117 @@ void TMR0ISR(void)
 // Receive FSK message and convert to integer
 void MainReceiveData(void)
 {
-    static uint8_t bitNum = 0;
-    static uint8_t index = 0;
+    // READ variables
+    static uint8_t bufferIndex = 0;
+    
+    // FILTER variables
+    static bool oldBit = 0;
+    static bool currentBit = 0;
+    static uint8_t bitIndex[] = {0,0}; // counts how long bit has {stayed the same, been different}
+    static uint8_t bitAverage = 0; // sum of last (FILTER_SIZE) bits
+    
+    // FILL_MESSAGE variables
+    static uint8_t messageIndex = 0;
+    
     if (R)
     {
         if (newSample)
         {
-            newSample = false;
-            // trigger if message is incoming
-            if (!receiveMessage && (ADRESH > HI_THRESH || ADRESH < LO_THRESH))
+            switch (currentState)
             {
-                receiveMessage = true;
-            }
+                case IDLE:
+                    if (ADRESH > HI_THRESH || ADRESH < LO_THRESH)
+                    {
+                        currentState = READ;
+                    }
+                    break;
+                    
+                case FILL_MESSAGE:
+                    // shift message and add new bit
+                    messageIn = (messageIn << 1) + currentBit;
+                    messageIndex++;
+                    
+                    currentState = READ;
+                    
+                    if (messageIndex == MESSAGE_SIZE) // full message has been read
+                    {
+                        messageIndex = 0;
+                        
+                        bitAverage = 0;
+                        bitIndex[0] = 0;
+                        bitIndex[1] = 0;
+                        
+                        bufferIndex = 0;
+                        ClearBuffer();
+                        
+                        receiveCode = (messageIn & 0xF000) >> 12;
 
-            // sample input and fill buffer
-            if (receiveMessage)
-            {
-                if (index == BUFFER_SIZE) {
-                    bufferFull = true;
-                    bitNum++;
-                    index = 0;
-                }
-                else
-                {
-                    bufferIn[index] = ADRESH;
-                    index++;
-                }
-            }
+                        messageIn = messageIn & 0x0FFF;
+                        MessageRoutine();
+                        
+                        currentState = IDLE;
+                    }
+                    break;
 
-            // trigger if full message is read
-            if (bitNum == MESSAGE_SIZE)
-            {
-                messageFull = true;
-                receiveMessage = false;
-            }
-        }
-        if (receiveMessage) // message incoming
-        {
+                case FILTER:
+                    // if Filter() outputs 0 and oldBit is 0, no change
+                    // if Filter() outputs 1 and oldBit is 0, bitAverage increases
+                    // if Filter() outputs 1 and oldBit is 1, no change
+                    // if Filter() outputs 0 and oldBit is 1, bitAverage decreases
+                    bitAverage += (Filter() - oldBit);
+                    
+                    if (bitAverage > FILTER_SIZE) bitAverage = FILTER_SIZE;
+                    if (bitAverage < 0) bitAverage = 0;
+                    
+                    currentBit = (bitAverage > FILTER_SIZE/2);
+                    // set oldBit for first bit input
+                    if (bitIndex[0] == 0)
+                    {
+                        oldBit = currentBit;
+                    }
+                    
+                    // count how long bit has stayed the same / been different
+                    bitIndex[0]++;
+                    if (currentBit == oldBit)
+                    {
+                        bitIndex[1] = 0;
+                        if (bitIndex[0] > FILTER_SIZE) // it's been long enough, read bit
+                        {
+                            currentState = FILL_MESSAGE;
+                            bitIndex[0] = 0;
+                        }
+                        else // not long enough, fill buffer again
+                        {
+                            currentState = READ;
+                        }
+                    }
+                    else
+                    {
+                        bitIndex[1]++;
+                        if (bitIndex[1] == FILTER_SIZE/2) // bit has been different for long enough, switch bit
+                        {
+                            oldBit = currentBit;
+                            
+                            bitIndex[0] = FILTER_SIZE/2;
+                            bitIndex[1] = 0;
+                        }
+                    }
 
-            if (bufferFull)
-            {
-                messageIn = (messageIn << 1) + Filter();
-                bufferFull = false;
-            }
-            if (messageFull)
-            {
-                receiveCode = (messageIn & 0x0F00) >> 12;
-                messageIn = messageIn & 0x0FFF;
-                MessageRoutine(receiveCode,messageIn);
-                messageFull = false;
-                R = false;
+                case READ:
+                    // fill buffer
+                    bufferIn[bufferIndex] = ADRESH;
+                    bufferIndex++;
+                    
+                    // if buffer full, filter
+                    if (bufferIndex == BUFFER_SIZE) 
+                    {
+                        currentState = FILTER;
+                        bufferIndex = 0;
+                    }
+                    break;
+                    
+                default:
+                    break;
             }
         }
     }
@@ -343,6 +419,9 @@ void MainReceiveData(void)
 // Filtering
 uint8_t Filter(void)
 {
+    // command to generate filters: a = fir1(BUFFER_SIZE-1,[0.15,0.2])
+    //                              b = fir1(BUFFER_SIZE-1,[0.2,0.25])
+    
     float filterLo[64] = { 0.000393,-0.000348,-0.001283,-0.002205,-0.002738,-0.002387,-0.000731, 0.002260,
                            0.005965, 0.009064, 0.009859, 0.006946, 0.000000,-0.009656,-0.019076,-0.024455,
                           -0.022503,-0.011950, 0.005433, 0.024861, 0.039785, 0.044085, 0.034470, 0.012142,
@@ -383,9 +462,9 @@ void TMR3ISR(void)
 }
 
 // Deal with message
-void MessageRoutine(short receiveCode, uint8_t messageIn)
+void MessageRoutine(void)
 {
-    printf("Code: %d    Message: %d\r\n",receiveCode,messageIn);
+    printf("Code: %X    Message: %X\r\n",receiveCode,messageIn);
     // code for surface microcontroller
     if (true)
     {
@@ -429,5 +508,13 @@ void MessageRoutine(short receiveCode, uint8_t messageIn)
                 
         }
         
+    }
+}
+
+void ClearBuffer(void)
+{
+    for (uint8_t i = 0; i < BUFFER_SIZE; i++)
+    {
+        bufferIn[i] = 0;
     }
 }
