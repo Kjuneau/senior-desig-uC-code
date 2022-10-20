@@ -9,7 +9,6 @@
 
 // todo:
 // add additional FIR filters for second set of frequencies
-// make receiving data capture signal based on how long bit has been high/low
 
 #include "mcc_generated_files/mcc.h"
 #pragma warning disable 520     // warning: (520) function "xyz" is never called  3
@@ -22,8 +21,8 @@
 #define HI_THRESH 80
 #define LO_THRESH 40
 
-#define FILTER_SIZE 16 // size of moving average filter
-#define BUFFER_SIZE 16 // size of buffer for frequency estimate
+#define FILTER_SIZE 8 // size of moving average filter
+#define BUFFER_SIZE 32 // size of buffer for frequency estimate
 #define MESSAGE_SIZE 16 // number of bits in message
 
 
@@ -39,7 +38,7 @@ enum READ_STATE
 
 //variables
 uint8_t amplitude = 5;
-uint16_t phaseIncrement;
+uint16_t phaseIncrement = 2000;
 uint8_t sin[64] =  {128,140,153,165,177,188,199,209,
                     218,227,234,241,246,250,253,255,
                     255,255,253,250,246,241,234,227,
@@ -48,6 +47,15 @@ uint8_t sin[64] =  {128,140,153,165,177,188,199,209,
                      37, 29, 22, 15, 10,  6,  2,  1,
                       0,  1,  2,  6, 10, 15, 22, 29,
                      37, 47, 56, 68, 79, 91,103,115};
+
+float filterLo[32] = {-0.004751,-0.001043, 0.005029, 0.014240, 0.024126, 0.028692, 0.0210412,-0.002131,
+                      -0.036743,-0.070904,-0.088970,-0.078654,-0.037824, 0.022735, 0.0825259, 0.119496,
+                       0.119496, 0.082525, 0.022735,-0.037824,-0.078654,-0.088970,-0.0709049,-0.036743,
+                      -0.002131, 0.021041, 0.028692, 0.024126, 0.014240, 0.005029,-0.0010432,-0.004751};
+float filterHi[32] = {-0.000300,-0.006012,-0.011904,-0.014209,-0.006539, 0.013737, 0.0390218, 0.052144,
+                       0.036663,-0.009156,-0.065645,-0.099861,-0.085633,-0.022685, 0.0592753, 0.116230,
+                       0.116230, 0.059275,-0.022685,-0.085633,-0.099861,-0.065645,-0.0091569, 0.036663,
+                       0.052144, 0.039021, 0.013737,-0.006539,-0.014209,-0.011904,-0.0060120,-0.000300};
 
 // sending flags
 bool M = false;
@@ -67,22 +75,19 @@ short sendCode;
 
 // receiving variables
 enum READ_STATE currentState = IDLE;
-uint16_t bufferIn[BUFFER_SIZE];
-bool filterIn[FILTER_SIZE];
 uint16_t messageIn = 0;
 short receiveCode = 0;
 
 // sending functions
 void MainSendData(void);
 uint16_t Convert(void);
-void TMR0ISR(void);
+void TMR1ISR(void);
 
 //receiving functions
 void MainReceiveData(void);
-uint8_t Filter(void);
+int8_t Filter(uint8_t adcVal);
 void TMR3ISR(void);
 void MessageRoutine(void);
-void ClearBuffer(void);
 
 //main
 void main(void) 
@@ -91,15 +96,18 @@ void main(void)
     char cmd;
     uint8_t i;
 
+    EPWM1_Initialize();
     ADC_Initialize();
     SYSTEM_Initialize();
     
+    TEST_PIN_SetLow();
+    
     // Provide Baud rate generator time to stabilize before splash screen
-    TMR0_WriteTimer(0xFFFF);
+    TMR0_WriteTimer(0x0000);
     INTCONbits.TMR0IF = 0;
     while (INTCONbits.TMR0IF == 0);
 
-    TMR0_SetInterruptHandler(TMR0ISR);
+    TMR1_SetInterruptHandler(TMR1ISR);
     TMR3_SetInterruptHandler(TMR3ISR);
     
     INTERRUPT_GlobalInterruptEnable();    
@@ -193,6 +201,12 @@ void main(void)
                     break;
                     
                 case 'T':
+                    printf("Start test\r\n");
+                    break;
+                    
+                case 't':
+                    printf("End test\r\n");
+                    generateWave = false;
                     break;
                     
                 default:
@@ -218,19 +232,21 @@ void MainSendData(void)
             printf("Enter message\r\n");
             messageOut = messageOut + Convert(); // add message as the last 12 bits
             getMessage = false;
+            INTCONbits.TMR0IF = 0;
+            TMR0_WriteTimer(0x0000);
         }
         
-        if (messageIndex < 16 && TMR1_HasOverflowOccured())
+        if (messageIndex < 16 && INTCONbits.TMR0IF == 1)
         {
             sendBit = messageOut & 0x0001;
             messageOut = messageOut >> 1;
-            if (sendBit) phaseIncrement = 2*(FREQUENCY + 0.075 * FREQUENCY);
-            else phaseIncrement = 2*(FREQUENCY - 0.075 * FREQUENCY);
+            if (sendBit) phaseIncrement = 4.48*(FREQUENCY + 0.075 * FREQUENCY);
+            else phaseIncrement = 4.45*(FREQUENCY - 0.075 * FREQUENCY);
             generateWave = true;
-            TMR1_WriteTimer(BIT_PERIOD);
             messageIndex++;
             
-            TEST_PIN_Toggle();
+            INTCONbits.TMR0IF = 0;
+            TMR0_WriteTimer(0x0000);
         }
         else if (messageIndex >= 16)
         {
@@ -242,7 +258,7 @@ void MainSendData(void)
     }
     else
     {
-        generateWave = false;
+        //generateWave = false;
     }
 }
 
@@ -263,7 +279,7 @@ uint16_t Convert(void)
 }
 
 // DDS ISR
-void TMR0ISR(void) 
+void TMR1ISR(void) 
 {
     uint8_t local;
     uint8_t localDiv2, localDiv4, localDiv8, localDiv16;
@@ -272,7 +288,7 @@ void TMR0ISR(void)
     static uint16_t phaseAccumulator = 0;
     
     //generate wave
-    if (generateWave == 1) 
+    if (generateWave) 
     {
         phaseAccumulator = phaseAccumulator + phaseIncrement;
         index = phaseAccumulator >> 10;
@@ -286,15 +302,12 @@ void TMR0ISR(void)
         if (amplitude&0b0010) total += localDiv8;
         if (amplitude&0b0100) total += localDiv4;
         if (amplitude&0b1000) total += localDiv2;
-        EPWM1_LoadDutyValue(total);
+        EPWM1_LoadDutyValue(total<<2);
     } 
     else 
     {
         EPWM1_LoadDutyValue(0x00);
     }
-    
-    INTCONbits.TMR0IF = 0;
-    TMR0_WriteTimer(0x10000-244);
 }
 
 // Receive FSK message and convert to integer
@@ -302,6 +315,7 @@ void MainReceiveData(void)
 {
     // READ variables
     static uint8_t bufferIndex = 0;
+    int8_t filterOutput = -1;
     
     // FILTER variables
     static bool oldBit = 0;
@@ -316,6 +330,7 @@ void MainReceiveData(void)
     {
         if (newSample)
         {
+            newSample = false;
             switch (currentState)
             {
                 case IDLE:
@@ -341,7 +356,6 @@ void MainReceiveData(void)
                         bitIndex[1] = 0;
                         
                         bufferIndex = 0;
-                        ClearBuffer();
                         
                         receiveCode = (messageIn & 0xF000) >> 12;
 
@@ -357,12 +371,13 @@ void MainReceiveData(void)
                     // if Filter() outputs 1 and oldBit is 0, bitAverage increases
                     // if Filter() outputs 1 and oldBit is 1, no change
                     // if Filter() outputs 0 and oldBit is 1, bitAverage decreases
-                    bitAverage += (Filter() - oldBit);
+                    bitAverage += (filterOutput - oldBit);
                     
                     if (bitAverage > FILTER_SIZE) bitAverage = FILTER_SIZE;
                     if (bitAverage < 0) bitAverage = 0;
                     
                     currentBit = (bitAverage > FILTER_SIZE/2);
+                    
                     // set oldBit for first bit input
                     if (bitIndex[0] == 0)
                     {
@@ -394,18 +409,16 @@ void MainReceiveData(void)
                             bitIndex[0] = FILTER_SIZE/2;
                             bitIndex[1] = 0;
                         }
+                        currentState = READ;
                     }
+                    break;
 
                 case READ:
                     // fill buffer
-                    bufferIn[bufferIndex] = ADRESH;
-                    bufferIndex++;
-                    
-                    // if buffer full, filter
-                    if (bufferIndex == BUFFER_SIZE) 
+                    filterOutput = Filter(ADRESH);
+                    if (filterOutput != -1)
                     {
                         currentState = FILTER;
-                        bufferIndex = 0;
                     }
                     break;
                     
@@ -417,43 +430,31 @@ void MainReceiveData(void)
 }
 
 // Filtering
-uint8_t Filter(void)
+int8_t Filter(uint8_t adcVal)
 {
     // command to generate filters: a = fir1(BUFFER_SIZE-1,[0.15,0.2])
     //                              b = fir1(BUFFER_SIZE-1,[0.2,0.25])
     
-    float filterLo[64] = { 0.000393,-0.000348,-0.001283,-0.002205,-0.002738,-0.002387,-0.000731, 0.002260,
-                           0.005965, 0.009064, 0.009859, 0.006946, 0.000000,-0.009656,-0.019076,-0.024455,
-                          -0.022503,-0.011950, 0.005433, 0.024861, 0.039785, 0.044085, 0.034470, 0.012142,
-                          -0.017024,-0.044049,-0.059741,-0.057947,-0.037972,-0.005185, 0.030499, 0.057843,
-                           0.068060, 0.057843, 0.030499,-0.005185,-0.037972,-0.057947,-0.059741,-0.044049,
-                          -0.017024, 0.012142, 0.034470, 0.044085, 0.039785, 0.024861, 0.005433,-0.011950,
-                          -0.022503,-0.024455,-0.019076,-0.009656, 0.000000, 0.006946, 0.009859, 0.009064,
-                           0.005965, 0.002260,-0.000731,-0.002387,-0.002738,-0.002205,-0.001283,-0.000348,
-                           0.000393};
-    float filterHi[64] = {-0.001028,-0.001485,-0.001280,-0.000177, 0.001689, 0.003567, 0.004160, 0.002255,
-                          -0.002274,-0.007738,-0.010909,-0.008618, 0.000000, 0.011980, 0.021107, 0.020877,
-                           0.008579,-0.011928,-0.030889,-0.037155,-0.024543, 0.003550, 0.034407, 0.051760,
-                           0.044488, 0.013498,-0.027409,-0.057841,-0.061328,-0.034472, 0.010490, 0.051491,
-                           0.067936, 0.051491, 0.010490,-0.034472,-0.061328,-0.057841,-0.027409, 0.013498,
-                           0.044488, 0.051760, 0.034407, 0.003550,-0.024543,-0.037155,-0.030889,-0.011928,
-                           0.008579, 0.020877, 0.021107, 0.011980, 0.000000,-0.008618,-0.010909,-0.007738,
-                          -0.002274, 0.002255, 0.004160, 0.003567, 0.001689,-0.000177,-0.001280,-0.001485,
-                          -0.001028};
+    static float hiVal = 0;
+    static float loVal = 0;
     
-    float hiVal = 0;
-    float loVal = 0;
-    for (int i = 0; i < 64; i++)
+    static uint8_t index = 0;
+
+    hiVal += adcVal * filterHi[index];
+    loVal += adcVal * filterLo[index];
+    index++;
+    
+    if (index == BUFFER_SIZE)
     {
-        hiVal += filterHi[i] * bufferIn[i];
-        loVal += filterLo[i] * bufferIn[i];
+        if (hiVal < 0) hiVal *= -1;
+        if (loVal < 0) loVal *= -1;
+        index = 0;
+        return hiVal > loVal;
     }
-    if (hiVal < 0) hiVal *= -1;
-    if (loVal < 0) loVal *= -1;
-    
-    return (hiVal > loVal);
+    return -1;
 }
 
+// Sampling ISR
 void TMR3ISR(void)
 {
     ADCON0bits.GO_NOT_DONE = 1;
@@ -464,7 +465,6 @@ void TMR3ISR(void)
 // Deal with message
 void MessageRoutine(void)
 {
-    printf("Code: %X    Message: %X\r\n",receiveCode,messageIn);
     // code for surface microcontroller
     if (true)
     {
@@ -483,38 +483,32 @@ void MessageRoutine(void)
                 break;
                 
             default:
-                printf("Code: %d Message: %d\r\n",receiveCode,messageIn);
+                printf("Code: %X Message: %X\r\n",receiveCode,messageIn);
                 break;
         }
-        
     }
+    
     // code for downhole microcontroller
-    if (false) 
+    if (false)
     {
-        
         switch (receiveCode)
         {
             case 0:
                 break;
                 
             case 1: // set pins
+                if (messageIn & 0x000F) ;// set pin 1
+                if (messageIn & 0x00F0) ;// set pin 2
+                if (messageIn & 0x0F00) ;// set pin 3
                 break;
                 
             case 2: // send temperature data
+                
                 break;
                 
             default:
                 break;
                 
         }
-        
-    }
-}
-
-void ClearBuffer(void)
-{
-    for (uint8_t i = 0; i < BUFFER_SIZE; i++)
-    {
-        bufferIn[i] = 0;
     }
 }
