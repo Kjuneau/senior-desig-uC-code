@@ -8,14 +8,29 @@
  */
 
 // todo:
+// test uC communication  
+    // get one uC to talk to itself
+    // get two uCs to talk to each other
+    // communicate from GUI to LED using two uCs
 // add additional FIR filters for second set of frequencies
+// write code in MessageRoutine() to handle messages for each end of communication
 
 #include "mcc_generated_files/mcc.h"
 #pragma warning disable 520     // warning: (520) function "xyz" is never called  3
 #pragma warning disable 1498    // fputc.c:16:: warning: (1498) pointer (unknown)
 
-//defines
-#define BIT_PERIOD 0x0000 // period of each bit / time to send one bit
+//*************************
+// TUNING defines
+//*************************
+
+#define TUNE_LowFreq 4.48
+#define TUNE_HighFreq 4.45
+
+#define TUNE_SamplingRate 0xe8f0
+#define TUNE_BitRate 0x0000
+
+//*************************
+
 #define FREQUENCY 1000 // frequency for sending data
 
 #define HI_THRESH 80
@@ -25,18 +40,9 @@
 #define BUFFER_SIZE 32 // size of buffer for frequency estimate
 #define MESSAGE_SIZE 16 // number of bits in message
 
+//*************************
 
-#define FUDGE_FACTOR 104 // fudge factor to tune input frequency accuracy
-
-enum READ_STATE
-{
-    IDLE = 0,
-    READ = 1,
-    FILTER = 2,
-    FILL_MESSAGE = 3
-};
-
-//variables
+// DDS variables
 uint8_t amplitude = 5;
 uint16_t phaseIncrement = 2000;
 uint8_t sin[64] =  {128,140,153,165,177,188,199,209,
@@ -48,6 +54,9 @@ uint8_t sin[64] =  {128,140,153,165,177,188,199,209,
                       0,  1,  2,  6, 10, 15, 22, 29,
                      37, 47, 56, 68, 79, 91,103,115};
 
+// digital filters for bit determination
+    // command to generate filters: a = fir1(BUFFER_SIZE-1,[0.15,0.2])
+    //                              b = fir1(BUFFER_SIZE-1,[0.2,0.25])
 float filterLo[32] = {-0.004751,-0.001043, 0.005029, 0.014240, 0.024126, 0.028692, 0.0210412,-0.002131,
                       -0.036743,-0.070904,-0.088970,-0.078654,-0.037824, 0.022735, 0.0825259, 0.119496,
                        0.119496, 0.082525, 0.022735,-0.037824,-0.078654,-0.088970,-0.0709049,-0.036743,
@@ -57,39 +66,56 @@ float filterHi[32] = {-0.000300,-0.006012,-0.011904,-0.014209,-0.006539, 0.01373
                        0.116230, 0.059275,-0.022685,-0.085633,-0.099861,-0.065645,-0.0091569, 0.036663,
                        0.052144, 0.039021, 0.013737,-0.006539,-0.014209,-0.011904,-0.0060120,-0.000300};
 
-// sending flags
+//*************************
+// SENDING VARIABLES
+//*************************
+
+// flags
 bool M = false;
 bool generateWave = false;
 
-// receiving flags
+// variables
+uint16_t messageOut = 0;
+bool sendBit;
+short sendCode;
+
+// functions
+void MainSendData(void);
+uint16_t Convert(void);
+void TMR1ISR(void);
+
+//*************************
+// RECEIVING VARIABLES
+//*************************
+
+// flags
 bool R = false;
 bool newSample = false;
 bool receiveMessage = false;
 bool bufferFull = false;
 bool messageFull = false;
 
-// sending variables
-uint16_t messageOut = 0;
-bool sendBit;
-short sendCode;
-
-// receiving variables
+// variables
+enum READ_STATE
+{
+    IDLE = 0,
+    READ = 1,
+    FILTER = 2,
+    FILL_MESSAGE = 3
+};
 enum READ_STATE currentState = IDLE;
 uint16_t messageIn = 0;
 short receiveCode = 0;
 
-// sending functions
-void MainSendData(void);
-uint16_t Convert(void);
-void TMR1ISR(void);
-
-//receiving functions
+// functions
 void MainReceiveData(void);
 int8_t Filter(uint8_t adcVal);
 void TMR3ISR(void);
 void MessageRoutine(void);
 
-//main
+//*************************
+
+
 void main(void) 
 {
     //local variables
@@ -240,13 +266,13 @@ void MainSendData(void)
         {
             sendBit = messageOut & 0x0001;
             messageOut = messageOut >> 1;
-            if (sendBit) phaseIncrement = 4.48*(FREQUENCY + 0.075 * FREQUENCY);
-            else phaseIncrement = 4.45*(FREQUENCY - 0.075 * FREQUENCY);
+            if (sendBit) phaseIncrement = TUNE_HighFreq*(FREQUENCY + 0.075 * FREQUENCY);
+            else phaseIncrement = TUNE_LowFreq*(FREQUENCY - 0.075 * FREQUENCY);
             generateWave = true;
             messageIndex++;
             
             INTCONbits.TMR0IF = 0;
-            TMR0_WriteTimer(0x0000);
+            TMR0_WriteTimer(TUNE_BitRate);
         }
         else if (messageIndex >= 16)
         {
@@ -432,9 +458,6 @@ void MainReceiveData(void)
 // Filtering
 int8_t Filter(uint8_t adcVal)
 {
-    // command to generate filters: a = fir1(BUFFER_SIZE-1,[0.15,0.2])
-    //                              b = fir1(BUFFER_SIZE-1,[0.2,0.25])
-    
     static float hiVal = 0;
     static float loVal = 0;
     
@@ -459,7 +482,7 @@ void TMR3ISR(void)
 {
     ADCON0bits.GO_NOT_DONE = 1;
     newSample = true;
-    TMR3_WriteTimer(0xe8f0); //tune if needed
+    TMR3_WriteTimer(TUNE_SamplingRate); //tune if needed
 }
 
 // Deal with message
